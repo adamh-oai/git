@@ -8,6 +8,7 @@ api_docs = [
 
 articles = [
   'bitmap-format.adoc',
+  'btrfs-worktrees.adoc',
   'build-systems.adoc',
   'bundle-uri.adoc',
   'commit-graph.adoc',

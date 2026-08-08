@@ -1,0 +1,76 @@
+Btrfs-backed worktree creation
+==============================
+
+Overview
+--------
+
+Git does not implement Btrfs snapshot creation itself. When
+`worktree.btrfsSnapshot` selects snapshot mode and `awacs` is available,
+`git worktree add` forwards its already-normalized request to:
+
+----
+awacs git worktree-add
+----
+
+Git keeps its normal option parsing, branch DWIM, and branch creation rules.
+AWACS owns the rest of the lifecycle: eligibility, ordinary linked-worktree
+registration, Btrfs snapshot creation, descendant AWACS state, index seeding,
+delta checkout, hooks, rollback, and physical removal.
+
+Configuration and selection
+---------------------------
+
+`worktree.btrfsSnapshot` accepts `false` (the default), `true`, or `auto`.
+`true` requires AWACS-backed creation and fails if AWACS is missing or the
+source is ineligible. `auto` asks AWACS to fall back to ordinary Git before
+creating a snapshot when eligibility fails. `--btrfs-snapshot` and
+`--no-btrfs-snapshot` override the configuration with `true` and `false`.
+
+The forwarder is deliberately small. It invokes AWACS only for checkout of a
+non-orphan ref from a source worktree; unsupported Git modes use the ordinary
+path in `auto` and fail in required mode. AWACS sets an internal bypass
+environment variable for its own recursive Git calls.
+
+AWACS sequence
+--------------
+
+For an eligible request AWACS:
+
+. verifies that the clean source is a Btrfs subvolume, has no gitlinks or
+  sparse index, and that the destination is absent;
+. asks Git to register the final destination with `--no-checkout` while the
+  internal bypass disables forwarding;
+. saves the registered `.git` gitfile, replaces the empty directory with a
+  Btrfs snapshot of the source, removes copied Git metadata, and restores the
+  gitfile;
+. derives and publishes the descendant AWACS state from the parent before any
+  checkout-time FSMonitor hook can run;
+. uses one `read-tree -m -u --index-output` invocation with the source index
+  to materialize only paths changed from the snapshot baseline and write one
+  independent destination index while disabling split-index, untracked-cache,
+  and FSMonitor extensions, then runs `post-checkout`;
+. writes an `awacs-worktree` marker in the linked-worktree administrative
+  directory.
+
+The index step is still O(N) in index entries, but it avoids an O(N) worktree
+stat or directory walk. Resolve-undo is cleared by `read-tree`; the destination
+does not share an index with the source.
+
+Removal and failure
+-------------------
+
+For a marked worktree, Git performs its normal lock, validation, and clean-tree
+checks, then forwards physical deletion to `awacs git worktree-remove`. AWACS
+deletes its per-subvolume state and the Btrfs subvolume; only after that
+succeeds does Git remove the linked-worktree administrative directory. Creation
+failures roll back both AWACS state and Git registration.
+
+Limitations
+-----------
+
+* AWACS invokes `btrfs` and recursive `git` from `PATH`.
+* The source must remain unchanged between eligibility checking and snapshot
+  creation.
+* Gitlinks and sparse indexes are rejected initially.
+* Ignored files are retained by the snapshot, unlike ordinary worktree
+  creation; checkout can still replace an ignored path that becomes tracked.

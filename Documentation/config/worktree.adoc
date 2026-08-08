@@ -17,3 +17,17 @@
 Note that setting `worktree.useRelativePaths` to "`true`" implies enabling the
 `extensions.relativeWorktrees` config (see linkgit:git-config[1]),
 thus making it incompatible with older versions of Git.
+
+`worktree.btrfsSnapshot`::
+	Control whether `git worktree add` creates new worktrees as Btrfs
+	snapshots of the current worktree. `false` disables snapshots and is
+	the default. `true` requires snapshot creation and makes the command
+	fail when its prerequisites are not met. `auto` uses a snapshot when
+	possible and otherwise falls back to normal worktree creation. The
+	`--btrfs-snapshot` and `--no-btrfs-snapshot` options override this
+	setting with `true` and `false`, respectively, for one invocation.
+	The `auto` mode has no command-line equivalent. Snapshot creation and
+	removal are delegated to `awacs git worktree-add` and
+	`awacs git worktree-remove`; Git keeps only option normalization and
+	the forwarding shim. See
+	link:technical/btrfs-worktrees.html[Btrfs-backed worktree creation].

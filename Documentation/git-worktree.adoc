@@ -10,6 +10,7 @@ SYNOPSIS
 --------
 [synopsis]
 git worktree add [-f] [--detach] [--checkout] [--lock [--reason <string>]]
+		 [--[no-]btrfs-snapshot]
 		 [--orphan] [(-b | -B) <new-branch>] <path> [<commit-ish>]
 git worktree list [-v | --porcelain [-z]]
 git worktree lock [--reason <string>] <worktree>
@@ -212,6 +213,19 @@ To remove a locked worktree, specify `--force` twice.
 	be used to suppress checkout in order to make customizations,
 	such as configuring sparse-checkout. See "Sparse checkout"
 	in linkgit:git-read-tree[1].
+
+`--btrfs-snapshot`::
+`--no-btrfs-snapshot`::
+	Ask AWACS to create the worktree as a Btrfs snapshot of the current
+	worktree.
+	The positive form requires snapshot creation; the negative form
+	disables it. These options override `worktree.btrfsSnapshot` for one
+	invocation. To request automatic fallback, set that configuration to
+	`auto`. The source must be clean except for ignored files and must not
+	contain submodules. Git delegates the snapshot lifecycle to
+	`awacs git worktree-add` when AWACS is available. See
+	link:technical/btrfs-worktrees.html[Btrfs-backed worktree creation]
+	for details.
 
 `--guess-remote`::
 `--no-guess-remote`::

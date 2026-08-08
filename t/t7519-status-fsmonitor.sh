@@ -477,4 +477,40 @@ test_expect_success 'status succeeds with sparse index' '
 	)
 '
 
+test_lazy_prereq BTRFS_AWACS '
+	test -n "$BTRFS_AWACS_TEST_ROOT" &&
+	test -x "$BTRFS_AWACS_TEST_HOOK" &&
+	test "$(findmnt -T "$BTRFS_AWACS_TEST_ROOT" -n -o FSTYPE)" = btrfs
+'
+
+test_expect_success BTRFS_AWACS 'AWACS hook matches a full status scan' '
+	awacs_repo="$BTRFS_AWACS_TEST_ROOT/t7519-awacs-$$" &&
+	btrfs subvolume create "$awacs_repo" &&
+	test_when_finished "btrfs subvolume delete \"$awacs_repo\"" &&
+	git -C "$awacs_repo" init &&
+	test_commit -C "$awacs_repo" initial tracked &&
+	awacs_hook="$awacs_repo/awacs-hook" &&
+	cat >"$awacs_hook" <<-\EOF &&
+		#!/bin/sh
+		BTRFS_AWACS_ROOT=$(git rev-parse --show-toplevel) || exit 1
+		export BTRFS_AWACS_ROOT
+		"$BTRFS_AWACS_TEST_HOOK" "$@"
+		status=$?
+		printf "%s\n" "$status" >"$BTRFS_AWACS_TEST_STATUS"
+		exit "$status"
+	EOF
+	chmod +x "$awacs_hook" &&
+	BTRFS_AWACS_TEST_STATUS="$awacs_repo/hook-status" &&
+	export BTRFS_AWACS_TEST_STATUS &&
+	git -C "$awacs_repo" config core.fsmonitor "$awacs_hook" &&
+	git -C "$awacs_repo" status --porcelain >actual &&
+	test "$(cat "$BTRFS_AWACS_TEST_STATUS")" = 0 &&
+	echo changed >"$awacs_repo/tracked" &&
+	echo new >"$awacs_repo/untracked" &&
+	git -C "$awacs_repo" status --porcelain >actual &&
+	test "$(cat "$BTRFS_AWACS_TEST_STATUS")" = 0 &&
+	git -C "$awacs_repo" -c core.fsmonitor= status --porcelain >expect &&
+	test_cmp expect actual
+'
+
 test_done

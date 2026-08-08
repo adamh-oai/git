@@ -9,6 +9,7 @@
 #include "copy.h"
 #include "dir.h"
 #include "environment.h"
+#include "exec-cmd.h"
 #include "gettext.h"
 #include "hex.h"
 #include "object-file.h"
@@ -22,6 +23,7 @@
 #include "remote.h"
 #include "run-command.h"
 #include "hook.h"
+#include "lockfile.h"
 #include "sigchain.h"
 #include "submodule.h"
 #include "utf8.h"
@@ -30,6 +32,7 @@
 
 #define BUILTIN_WORKTREE_ADD_USAGE \
 	N_("git worktree add [-f] [--detach] [--checkout] [--lock [--reason <string>]]\n" \
+	   "                 [--[no-]btrfs-snapshot]\n" \
 	   "                 [--orphan] [(-b | -B) <new-branch>] <path> [<commit-ish>]")
 
 #define BUILTIN_WORKTREE_LIST_USAGE \
@@ -116,6 +119,12 @@ static const char * const git_worktree_unlock_usage[] = {
 	NULL
 };
 
+enum btrfs_snapshot_mode {
+	BTRFS_SNAPSHOT_FALSE = 0,
+	BTRFS_SNAPSHOT_TRUE,
+	BTRFS_SNAPSHOT_AUTO,
+};
+
 struct add_opts {
 	int force;
 	int detach;
@@ -123,6 +132,7 @@ struct add_opts {
 	int checkout;
 	int orphan;
 	int relative_paths;
+	enum btrfs_snapshot_mode btrfs_snapshot;
 	const char *keep_locked;
 };
 
@@ -130,7 +140,24 @@ static int show_only;
 static int verbose;
 static int guess_remote;
 static int use_relative_paths;
+static enum btrfs_snapshot_mode btrfs_snapshot_mode;
 static timestamp_t expire;
+
+static int parse_btrfs_snapshot_mode(const char *value,
+				     enum btrfs_snapshot_mode *mode)
+{
+	int boolean = git_parse_maybe_bool(value);
+
+	if (boolean >= 0) {
+		*mode = boolean ? BTRFS_SNAPSHOT_TRUE : BTRFS_SNAPSHOT_FALSE;
+		return 0;
+	}
+	if (value && !strcasecmp(value, "auto")) {
+		*mode = BTRFS_SNAPSHOT_AUTO;
+		return 0;
+	}
+	return -1;
+}
 
 static int git_worktree_config(const char *var, const char *value,
 			       const struct config_context *ctx, void *cb)
@@ -141,9 +168,83 @@ static int git_worktree_config(const char *var, const char *value,
 	} else if (!strcmp(var, "worktree.userelativepaths")) {
 		use_relative_paths = git_config_bool(var, value);
 		return 0;
+	} else if (!strcmp(var, "worktree.btrfssnapshot")) {
+		if (parse_btrfs_snapshot_mode(value, &btrfs_snapshot_mode))
+			return error(_("invalid value for '%s': '%s'"), var,
+				     value ? value : "");
+		return 0;
 	}
 
 	return git_default_config(var, value, ctx, cb);
+}
+
+/*
+ * Git retains option parsing, DWIM, and branch creation.  Once those semantics
+ * are normalized, AWACS owns the snapshot worktree lifecycle.  Its recursive
+ * Git calls set this variable so they use the ordinary linked-worktree path.
+ */
+#define GIT_AWACS_BYPASS_ENVIRONMENT "GIT_AWACS_BYPASS"
+
+static int run_awacs_worktree_add(const char *path, const char *refname,
+				  const struct add_opts *opts, int check_only,
+				  int no_check)
+{
+	struct child_process cp = CHILD_PROCESS_INIT;
+	const char *source = repo_get_work_tree(the_repository);
+	struct strbuf git = STRBUF_INIT;
+	int i;
+
+	if (opts->btrfs_snapshot == BTRFS_SNAPSHOT_FALSE ||
+	    git_env_bool(GIT_AWACS_BYPASS_ENVIRONMENT, 0))
+		return 0;
+	if (!opts->checkout || opts->orphan || !source) {
+		if (opts->btrfs_snapshot == BTRFS_SNAPSHOT_TRUE)
+			return error(_("AWACS snapshot worktrees require checkout, "
+				       "a non-orphan ref, and a source worktree"));
+		return 0;
+	}
+	if (!exists_in_PATH("awacs")) {
+		if (opts->btrfs_snapshot == BTRFS_SNAPSHOT_TRUE)
+			return error(_("AWACS is required for --btrfs-snapshot"));
+		return 0;
+	}
+
+	if (!opts->quiet) {
+		if (check_only)
+			fprintf_ln(stderr, _("Validating snapshot worktree source before creating branch"));
+		else
+			fprintf_ln(stderr, _("Creating snapshot-backed worktree for '%s'"), refname);
+	}
+
+	strbuf_addf(&git, "%s/git", git_exec_path());
+	strvec_pushl(&cp.args, "awacs", "git", "worktree-add",
+		     "--git", git.buf,
+		     "--source", source, "--destination", path,
+		     "--ref", refname, NULL);
+	if (opts->btrfs_snapshot == BTRFS_SNAPSHOT_TRUE)
+		strvec_push(&cp.args, "--required");
+	if (opts->detach)
+		strvec_push(&cp.args, "--detach");
+	for (i = 0; i < opts->force; i++)
+		strvec_push(&cp.args, "--force");
+	if (opts->relative_paths)
+		strvec_push(&cp.args, "--relative-paths");
+	if (opts->keep_locked) {
+		strvec_push(&cp.args, "--lock-reason");
+		strvec_push(&cp.args, opts->keep_locked);
+	}
+	if (opts->quiet)
+		strvec_push(&cp.args, "--quiet");
+	if (check_only)
+		strvec_push(&cp.args, "--check-only");
+	if (no_check)
+		strvec_push(&cp.args, "--no-check");
+	if (run_command(&cp)) {
+		strbuf_release(&git);
+		return -1;
+	}
+	strbuf_release(&git);
+	return 1;
 }
 
 static int delete_git_dir(const char *id)
@@ -466,7 +567,7 @@ static int add_worktree(const char *path, const char *refname,
 	const char *name;
 	struct strvec child_env = STRVEC_INIT;
 	unsigned int counter = 0;
-	int len, ret;
+	int len, ret = 0;
 	struct strbuf symref = STRBUF_INIT;
 	struct commit *commit = NULL;
 	int is_branch = 0;
@@ -490,7 +591,6 @@ static int add_worktree(const char *path, const char *refname,
 	commit = lookup_commit_reference_by_name(refname);
 	if (!commit && !opts->orphan)
 		die(_("invalid reference: %s"), refname);
-
 	name = worktree_basename(path, &len);
 	strbuf_add(&sb, name, path + len - name);
 	sanitize_refname_component(sb.buf, &sb_name);
@@ -531,11 +631,12 @@ static int add_worktree(const char *path, const char *refname,
 	else
 		write_file(sb.buf, _("initializing"));
 
+	junk_work_tree = xstrdup(path);
+
 	strbuf_addf(&sb_git, "%s/.git", path);
 	if (safe_create_leading_directories_const(the_repository, sb_git.buf))
 		die_errno(_("could not create leading directories of '%s'"),
 			  sb_git.buf);
-	junk_work_tree = xstrdup(path);
 
 	strbuf_reset(&sb);
 	strbuf_addf(&sb, "%s/gitdir", sb_repo.buf);
@@ -582,7 +683,6 @@ static int add_worktree(const char *path, const char *refname,
 	 */
 	if (the_repository->repository_format_worktree_config)
 		copy_filtered_worktree_config(sb_repo.buf);
-
 	strvec_pushf(&child_env, "%s=%s", GIT_DIR_ENVIRONMENT, sb_git.buf);
 	strvec_pushf(&child_env, "%s=%s", GIT_WORK_TREE_ENVIRONMENT, path);
 
@@ -599,7 +699,7 @@ static int add_worktree(const char *path, const char *refname,
 	FREE_AND_NULL(junk_git_dir);
 
 done:
-	if (ret || !opts->keep_locked) {
+	if (sb_repo.len && (ret || !opts->keep_locked)) {
 		strbuf_reset(&sb);
 		strbuf_addf(&sb, "%s/locked", sb_repo.buf);
 		unlink_or_warn(sb.buf);
@@ -633,33 +733,43 @@ done:
 	return ret;
 }
 
-static void print_preparing_worktree_line(int detach,
-					  const char *branch,
-					  const char *new_branch,
-					  int force_new_branch)
+static void print_worktree_stage_line(int detach,
+				      int checkout,
+				      const char *branch,
+				      const char *new_branch,
+				      int force_new_branch)
 {
 	if (force_new_branch) {
 		struct commit *commit = lookup_commit_reference_by_name(new_branch);
 		if (!commit)
-			fprintf_ln(stderr, _("Preparing worktree (new branch '%s')"), new_branch);
+			fprintf_ln(stderr, _("Creating branch '%s' for worktree"), new_branch);
 		else
-			fprintf_ln(stderr, _("Preparing worktree (resetting branch '%s'; was at %s)"),
+			fprintf_ln(stderr, _("Resetting branch '%s' for worktree; was at %s"),
 				  new_branch,
 				  repo_find_unique_abbrev(the_repository, &commit->object.oid, DEFAULT_ABBREV));
 	} else if (new_branch) {
-		fprintf_ln(stderr, _("Preparing worktree (new branch '%s')"), new_branch);
+		fprintf_ln(stderr, _("Creating branch '%s' for worktree"), new_branch);
 	} else {
 		struct strbuf s = STRBUF_INIT;
 		if (!detach && !check_branch_ref(the_repository, &s, branch) &&
-		    refs_ref_exists(get_main_ref_store(the_repository), s.buf))
-			fprintf_ln(stderr, _("Preparing worktree (checking out '%s')"),
-				  branch);
+		    refs_ref_exists(get_main_ref_store(the_repository), s.buf)) {
+			if (checkout)
+				fprintf_ln(stderr, _("Checking out branch '%s' into worktree"),
+					  branch);
+			else
+				fprintf_ln(stderr, _("Registering linked worktree for branch '%s' (checkout deferred)"),
+					  branch);
+		}
 		else {
 			struct commit *commit = lookup_commit_reference_by_name(branch);
 			if (!commit)
 				BUG("unreachable: invalid reference: %s", branch);
-			fprintf_ln(stderr, _("Preparing worktree (detached HEAD %s)"),
-				  repo_find_unique_abbrev(the_repository, &commit->object.oid, DEFAULT_ABBREV));
+			if (checkout)
+				fprintf_ln(stderr, _("Checking out detached HEAD %s into worktree"),
+					  repo_find_unique_abbrev(the_repository, &commit->object.oid, DEFAULT_ABBREV));
+			else
+				fprintf_ln(stderr, _("Registering linked worktree at detached HEAD %s (checkout deferred)"),
+					  repo_find_unique_abbrev(the_repository, &commit->object.oid, DEFAULT_ABBREV));
 		}
 		strbuf_release(&s);
 	}
@@ -800,8 +910,15 @@ static int add(int ac, const char **av, const char *prefix,
 	const char *new_branch = NULL;
 	char *opt_track = NULL;
 	const char *lock_reason = NULL;
+	struct strbuf created_branch_ref = STRBUF_INIT;
+	struct object_id created_branch_oid = { 0 };
+	struct object_id previous_branch_oid = { 0 };
+	int created_branch = 0;
+	int branch_had_previous_oid = 0;
 	int keep_locked = 0;
+	int btrfs_snapshot = -1;
 	int used_new_branch_options;
+	int snapshot_preflight_succeeded = 0;
 	struct option options[] = {
 		OPT__FORCE(&opts.force,
 			   N_("checkout <branch> even if already checked out in other worktree"),
@@ -813,6 +930,8 @@ static int add(int ac, const char **av, const char *prefix,
 		OPT_BOOL(0, "orphan", &opts.orphan, N_("create unborn branch")),
 		OPT_BOOL('d', "detach", &opts.detach, N_("detach HEAD at named commit")),
 		OPT_BOOL(0, "checkout", &opts.checkout, N_("populate the new working tree")),
+		OPT_BOOL(0, "btrfs-snapshot", &btrfs_snapshot,
+			 N_("create from a Btrfs snapshot")),
 		OPT_BOOL(0, "lock", &keep_locked, N_("keep the new working tree locked")),
 		OPT_STRING(0, "reason", &lock_reason, N_("string"),
 			   N_("reason for locking")),
@@ -831,7 +950,11 @@ static int add(int ac, const char **av, const char *prefix,
 	memset(&opts, 0, sizeof(opts));
 	opts.checkout = 1;
 	opts.relative_paths = use_relative_paths;
+	opts.btrfs_snapshot = btrfs_snapshot_mode;
 	ac = parse_options(ac, av, prefix, options, git_worktree_add_usage, 0);
+	if (btrfs_snapshot >= 0)
+		opts.btrfs_snapshot = btrfs_snapshot ? BTRFS_SNAPSHOT_TRUE :
+			BTRFS_SNAPSHOT_FALSE;
 	if (!!opts.detach + !!new_branch + !!new_branch_force > 1)
 		die(_("options '%s', '%s', and '%s' cannot be used together"), "-b", "-B", "--detach");
 	if (opts.detach && opts.orphan)
@@ -929,13 +1052,45 @@ static int add(int ac, const char **av, const char *prefix,
 		die(_("invalid reference: %s"), branch);
 	}
 
+	if (new_branch) {
+		/*
+		 * AWACS owns snapshot eligibility and inherited-index validation.
+		 * Check those before creating a branch, then repeat them inside
+		 * the real delegated add to close the race with source changes.
+		 */
+		ret = run_awacs_worktree_add(path, branch, &opts, 1, 0);
+		if (ret < 0)
+			goto cleanup;
+		/*
+		 * In required snapshot mode, successful preflight proves that AWACS
+		 * accepted the mutable-source checks. Skip repeating that expensive
+		 * pass after the branch is created. This deliberately accepts the
+		 * small branch-creation race; static eligibility failures still happen
+		 * before the inferred branch exists.
+		 *
+		 * Auto mode cannot use this shortcut because a successful preflight
+		 * may mean "fall back to ordinary Git" rather than "snapshot eligible".
+		 */
+		snapshot_preflight_succeeded =
+			opts.btrfs_snapshot == BTRFS_SNAPSHOT_TRUE && ret > 0;
+	}
+
 	if (!opts.quiet)
-		print_preparing_worktree_line(opts.detach, branch, new_branch, !!new_branch_force);
+		print_worktree_stage_line(opts.detach, opts.checkout, branch, new_branch,
+					  !!new_branch_force);
 
 	if (opts.orphan) {
 		branch = new_branch;
 	} else if (new_branch) {
 		struct child_process cp = CHILD_PROCESS_INIT;
+
+		if (check_branch_ref(the_repository, &created_branch_ref,
+				     new_branch))
+			die(_("invalid branch name: '%s'"), new_branch);
+		branch_had_previous_oid =
+			!refs_read_ref(get_main_ref_store(the_repository),
+				       created_branch_ref.buf,
+				       &previous_branch_oid);
 		cp.git_cmd = 1;
 		strvec_push(&cp.args, "branch");
 		if (new_branch_force)
@@ -950,13 +1105,46 @@ static int add(int ac, const char **av, const char *prefix,
 			ret = -1;
 			goto cleanup;
 		}
+		if (refs_read_ref(get_main_ref_store(the_repository),
+				  created_branch_ref.buf,
+				  &created_branch_oid)) {
+			error(_("failed to read newly created branch '%s'"),
+			      new_branch);
+			ret = -1;
+			goto cleanup;
+		}
+		created_branch = 1;
 		branch = new_branch;
 	} else if (opt_track) {
 		die(_("--[no-]track can only be used if a new branch is created"));
 	}
 
-	ret = add_worktree(path, branch, &opts);
+	ret = run_awacs_worktree_add(path, branch, &opts, 0,
+				     snapshot_preflight_succeeded);
+	if (!ret)
+		ret = add_worktree(path, branch, &opts);
+	else if (ret > 0)
+		ret = 0;
 cleanup:
+	if (ret && created_branch) {
+		int rollback_ret;
+
+		if (branch_had_previous_oid)
+			rollback_ret = refs_update_ref(
+				get_main_ref_store(the_repository),
+				"worktree add: restore branch after failure",
+				created_branch_ref.buf, &previous_branch_oid,
+				&created_branch_oid, 0, UPDATE_REFS_MSG_ON_ERR);
+		else
+			rollback_ret = refs_delete_ref(
+				get_main_ref_store(the_repository),
+				"worktree add: remove branch after failure",
+				created_branch_ref.buf, &created_branch_oid, 0);
+		if (rollback_ret)
+			warning(_("failed to roll back branch '%s' after worktree add failure"),
+				new_branch);
+	}
+	strbuf_release(&created_branch_ref);
 	free(path);
 	free(opt_track);
 	free(branch_to_free);
@@ -1365,10 +1553,25 @@ static void check_clean_worktree(struct worktree *wt,
 			  original_path, ret);
 }
 
+static int is_awacs_worktree(struct worktree *wt)
+{
+	return file_exists(worktree_git_path(wt, "awacs-worktree"));
+}
+
 static int delete_git_work_tree(struct worktree *wt)
 {
 	struct strbuf sb = STRBUF_INIT;
+	struct child_process cp = CHILD_PROCESS_INIT;
 	int ret = 0;
+
+	if (is_awacs_worktree(wt)) {
+		if (!exists_in_PATH("awacs"))
+			return error(_("AWACS is required to remove snapshot worktree '%s'"),
+				     wt->path);
+		strvec_pushl(&cp.args, "awacs", "git", "worktree-remove",
+			     "--path", wt->path, NULL);
+		return run_command(&cp);
+	}
 
 	strbuf_addstr(&sb, wt->path);
 	if (remove_dir_recursively(&sb, 0)) {
@@ -1418,10 +1621,16 @@ static int remove_worktree(int ac, const char **av, const char *prefix,
 	strbuf_release(&errmsg);
 
 	if (file_exists(wt->path)) {
+		int is_awacs_snapshot = is_awacs_worktree(wt);
+
 		if (!force)
 			check_clean_worktree(wt, av[0]);
 
 		ret |= delete_git_work_tree(wt);
+		if (ret && is_awacs_snapshot) {
+			free_worktrees(worktrees);
+			return ret;
+		}
 	}
 	/*
 	 * continue on even if ret is non-zero, there's no going back
